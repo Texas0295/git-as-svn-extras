@@ -18,9 +18,6 @@ Env overrides:
   REMOTE     (default: $REMOTE)
   SERVICE    (default: $SERVICE)
   MAPDB      (default: $MAPDB)
-
-Example:
-  $(basename "$0") Solian v3
 EOF
   exit 1
 }
@@ -46,11 +43,12 @@ git -C "$REPO" fetch "$REMOTE" --prune
 REMOTE_REF="refs/remotes/$REMOTE/$BRANCH"
 git -C "$REPO" show-ref --verify --quiet "$REMOTE_REF" || die "Remote branch not found: $REMOTE_REF"
 
+BACKUP_REF=""
 if git -C "$REPO" show-ref --verify --quiet "refs/heads/$BRANCH"; then
   CUR=$(git -C "$REPO" rev-parse "refs/heads/$BRANCH")
-  BAK="refs/heads/backup/gasvn-${BRANCH}-$(date +%Y%m%d-%H%M%S)"
-  git -C "$REPO" update-ref "$BAK" "$CUR"
-  log "Backed up $BRANCH: $BAK -> $CUR"
+  BACKUP_REF="refs/heads/backup/gasvn-${BRANCH}-$(date +%Y%m%d-%H%M%S)"
+  git -C "$REPO" update-ref "$BACKUP_REF" "$CUR"
+  log "Backed up $BRANCH: $BACKUP_REF -> $CUR"
 else
   log "No existing local branch $BRANCH (skip backup)"
 fi
@@ -63,8 +61,6 @@ GASVN_TIMELINE="refs/git-as-svn/v1/$BRANCH"
 if git -C "$REPO" show-ref --verify --quiet "$GASVN_TIMELINE"; then
   git -C "$REPO" update-ref -d "$GASVN_TIMELINE"
   log "Deleted timeline ref $GASVN_TIMELINE"
-else
-  log "Timeline ref $GASVN_TIMELINE not present (ok)"
 fi
 
 log "Restarting $SERVICE and clearing cache ..."
@@ -72,8 +68,13 @@ systemctl --user stop "$SERVICE"
 [[ -f "$MAPDB" ]] && rm -f "$MAPDB" && log "Removed cache DB: $MAPDB"
 systemctl --user start "$SERVICE"
 
-log "Tail service logs (last 20):"
-journalctl --user -u "$SERVICE" -n 20 --no-pager || true
+log "Tail service logs (last 10):"
+journalctl --user -u "$SERVICE" -n 10 --no-pager || true
+
+if [[ -n "$BACKUP_REF" ]]; then
+  git -C "$REPO" update-ref -d "$BACKUP_REF"
+  log "Deleted backup ref $BACKUP_REF after successful alignment"
+fi
 
 log "Done. Tip of $REPO_NAME/$BRANCH is now $NEW"
 echo
