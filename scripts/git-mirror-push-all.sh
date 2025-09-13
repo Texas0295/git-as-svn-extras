@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export GNUPGHOME="$HOME/.gnupg"
-export GPG_TTY=$(tty)
-
 REPO_ROOT="/srv/git/repositories"
 
 REMOTE_NAME="origin"
