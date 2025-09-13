@@ -1,15 +1,40 @@
-From 3d47b50999c56214c7f44866291d3479749eeb4e Mon Sep 17 00:00:00 2001
+From 31981bdc9b1b3d45c280b6997d0d5607fc518905 Mon Sep 17 00:00:00 2001
 From: Texas0295 <kimura@texas0295.top>
 Date: Thu, 11 Sep 2025 20:07:16 +0800
 Subject: [PATCH] [FEA] gitwriter: GPG Sign
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+X-Developer-Signature: v=1; a=openpgp-sha256; l=8022; i=kimura@texas0295.top;
+ h=from:subject; bh=NDnXEyZWA5Jg3dUQLZy3jNYwWYohcJjK9acpbLZn0zI=;
+ b=owEBbQKS/ZANAwAKAbuGMV5SAGvRAcsmYgBoxSlFIoCd9BQBr8WASQQZ8LTgMYr6XjKCTIf2w
+ CCsl89MEveJAjMEAAEKAB0WIQQCP6b3bIB19d6g35+7hjFeUgBr0QUCaMUpRQAKCRC7hjFeUgBr
+ 0ZI4D/9CljdV8ez0oCxfBgDTI+mp28Aqmu7Ix3E/s3qENaCY3Nu0977E3QdX7KOKynYbOayF7EV
+ ExZo0jyLYTP9AI/Z169zeStdt8Wj7XNqCMQcF+YWlWTdF4UjonaTyN7QbrCvTGwOgg6A4QroHku
+ TuN5QhPjDTcai+x49ksj1iucY/UHG6Imni19hRn5zkZwt+PE2bI4P9ITZfPDqKkIZdXCJp/lXnK
+ +BqEWuPuxaKOQPKQ+CXqeZ6FhUE5Yl4QRwc3kWMGvi9e2MiPS/dh73F1FleTYmKT7l7fqjQZnmh
+ jnCE4rmNbuWwL7qgOibMs2v1sJMbyTtfxHpiZu/7IpoIMtF+ikIGOhIpubu2zYtvYbF92L2YDt+
+ UU77C56FaYZqhrjLhjOj7+yJrLBWbaQLCjJUfqBocNkUPSXkeVijyjzWbOTqMvv98g3izm1G8yO
+ dTAyq272Og2TzMyLRSPW2D2YTZ6JeD9eMUV/82oGxbLiEiXWLZ79qmHP2PLDO/ShUaMnFZenj5U
+ UzX/UOnt8QKqqBby7Lsg1Od9mW3XljX0gti5t/2HEZeF2vNdrnmIZvn/yR0Tan5F5PGdD4KUScz
+ yaAENFTmh5ulTb42UTvbr0mgpeQ3P4vxqD/Aw4QnVGIV86dkJCa1kFqLCgBGC3+Z9HoTp5mP08s
+ uOX5ZF3mW4rXrQg==
+X-Developer-Key: i=kimura@texas0295.top; a=openpgp;
+ fpr=2B4C119A188E067287F05E30BFE26B74CDC851FB
+
+- Extracted commit signing logic into helper functions
+- Added env-controlled switches:
+  * GSVN_FORCE_SIGN → reject unsigned commit when =1
+  * GSVN_SIGNOFF → auto append DCO trailer when =1
+- Default remains compatible with unsigned commits
 
 Signed-off-by: Texas0295 <kimura@texas0295.top>
 ---
- .../svnserver/repository/git/GitWriter.kt     | 53 ++++++++++++++++++-
- 1 file changed, 52 insertions(+), 1 deletion(-)
+ .../svnserver/repository/git/GitWriter.kt     | 129 +++++++++++++++++-
+ 1 file changed, 123 insertions(+), 6 deletions(-)
 
 diff --git a/src/main/kotlin/svnserver/repository/git/GitWriter.kt b/src/main/kotlin/svnserver/repository/git/GitWriter.kt
-index 9dd18dc4..88d0749a 100644
+index 9dd18dc4..f0589a1b 100644
 --- a/src/main/kotlin/svnserver/repository/git/GitWriter.kt
 +++ b/src/main/kotlin/svnserver/repository/git/GitWriter.kt
 @@ -26,6 +26,8 @@ import svnserver.repository.git.prop.PropertyMapping
@@ -21,64 +46,154 @@ index 9dd18dc4..88d0749a 100644
  import java.io.IOException
  import java.util.*
  import java.util.concurrent.locks.ReentrantLock
-@@ -294,7 +296,56 @@ class GitWriter internal constructor(val branch: GitBranch, private val pusher:
-                 commitBuilder.setParentId(parentCommit.id)
+@@ -284,19 +286,46 @@ class GitWriter internal constructor(val branch: GitBranch, private val pusher:
+             val root: GitTreeUpdate = treeStack.element()
+             val treeId: ObjectId = root.buildTree(inserter)
+             log.debug("Create tree {} for commit.", treeId.name())
++
+             val commitBuilder = CommitBuilder()
+             val ident: PersonIdent = createIdent(userInfo)
+             commitBuilder.author = ident
+             commitBuilder.committer = ident
+-            commitBuilder.message = message
+-            val parentCommit: RevCommit? = revision.gitNewCommit
+-            if (parentCommit != null) {
+-                commitBuilder.setParentId(parentCommit.id)
++
++            val baseMessage = normalizeMessage(message)
++
++            val finalMessage = if (isSignOffEnabled()) {
++                appendSignOff(baseMessage, ident)
++            } else {
++                ensureTrailingNewline(baseMessage)
              }
++            commitBuilder.message = finalMessage
++
++            val parentCommit: RevCommit? = revision.gitNewCommit
++            if (parentCommit != null) commitBuilder.setParentId(parentCommit.id)
              commitBuilder.setTreeId(treeId)
 -            val commitId: ObjectId = inserter.insert(commitBuilder)
-+            fun externalSignedCommit(): ObjectId? {
-+                try {
-+                    val repoDir = branch.repository.git.directory.absolutePath
-+                    val cmd = mutableListOf("git", "-C", repoDir, "commit-tree", "-S", treeId.name())
-+                    if (parentCommit != null) {
-+                        cmd.addAll(listOf("-p", parentCommit.id.name()))
-+                    }
-+                    for (line in message.split("\n")) {
-+                        cmd.addAll(listOf("-m", line))
-+                    }
-+                    val pb = ProcessBuilder(cmd).redirectErrorStream(true)
-+                    val env = pb.environment()
-+                    env["HOME"] = System.getProperty("user.home")
-+                    env["GNUPGHOME"] = System.getenv("GNUPGHOME") ?: (System.getProperty("user.home") + "/.gnupg")
-+                    env["PATH"] = (System.getenv("PATH") ?: "") +
-+                                  (if ((System.getenv("PATH") ?: "").endsWith(":")) "" else ":") +
-+                                  (System.getProperty("user.home") + "/.local/bin")
-+                    env["GIT_AUTHOR_NAME"] = ident.name
-+                    env["GIT_AUTHOR_EMAIL"] = ident.emailAddress ?: ""
-+                    env["GIT_COMMITTER_NAME"] = ident.name
-+                    env["GIT_COMMITTER_EMAIL"] = ident.emailAddress ?: ""
 +
-+                    val p = pb.start()
-+                    val out = p.inputStream.bufferedReader().readText().trim()
-+                    val code = p.waitFor()
-+                    if (code == 0 && out.isNotBlank()) {
-+                        val first = out.lineSequence().first().trim()
-+                        val hex40 = Pattern.compile("^[0-9a-fA-F]{40}$")
-+                        if (hex40.matcher(first).matches()) {
-+                            log.info("External signed commit created: {}", first)
-+                            return ObjectId.fromString(first)
-+                        } else {
-+                            val candidate = first.split(Regex("\\s+")).last()
-+                            if (hex40.matcher(candidate).matches()) {
-+                                log.info("External signed commit created: {}", candidate)
-+                                return ObjectId.fromString(candidate)
-+                            }
-+                        }
-+                        log.warn("External commit-tree returned non-hash output: {}", out)
-+                    } else {
-+                        log.warn("External commit-tree failed (code={}): {}", code, out)
-+                    }
-+                } catch (t: Throwable) {
-+                    log.warn("External commit-tree exception: {}", t.toString())
++            val forceSign = isForceSignEnabled()
++            val signedId: ObjectId? = externalSignedCommitOrNull(
++                repoDir = branch.repository.git.directory.absolutePath,
++                treeId = treeId,
++                parent = parentCommit,
++                message = finalMessage,
++                ident = ident
++            )
++            val commitId: ObjectId = when {
++                signedId != null -> signedId
++                forceSign -> {
++                    val err = "GSVN_FORCE_SIGN=1: signing required but failed; rejecting commit"
++                    log.warn(err)
++                    throw SVNException(SVNErrorMessage.create(SVNErrorCode.REPOS_HOOK_FAILURE, err))
 +                }
-+                return null
++                else -> inserter.insert(commitBuilder)
 +            }
 +
-+            val signedId = externalSignedCommit()
-+            val commitId: ObjectId = signedId ?: inserter.insert(commitBuilder)
              inserter.flush()
-             log.info("Create commit {}: {}", commitId.name(), StringHelper.getFirstLine(message))
+-            log.info("Create commit {}: {}", commitId.name(), StringHelper.getFirstLine(message))
++            log.info("Create commit {}: {}", commitId.name(), StringHelper.getFirstLine(finalMessage))
++
              if (filterMigration(RevWalk(branch.repository.git).parseTree(treeId)) != 0) {
+                 log.info("Need recreate tree after filter migration.")
+                 return null
+@@ -319,6 +348,94 @@ class GitWriter internal constructor(val branch: GitBranch, private val pusher:
+             }
+         }
+ 
++        private fun isForceSignEnabled(): Boolean {
++          val v = System.getenv("GSVN_FORCE_SIGN") ?: return false
++            return v == "1" || v.equals("true", true) || v.equals("yes", true)
++        }
++
++        private fun isSignOffEnabled(): Boolean {
++            val v = System.getenv("GSVN_SIGNOFF") ?: return false
++            return v == "1" || v.equals("true", true) || v.equals("yes", true)
++        }
++
++        private fun normalizeMessage(msg0: String): String =
++            msg0.trimEnd('\r','\n'
++        )
++        private fun ensureTrailingNewline(s: String): String =
++            s.trimEnd('\r','\n') + "\n"
++
++        private fun appendSignOff(msg0: String, id: PersonIdent): String {
++            val has = Regex("(?im)^Signed-off-by:\\s").containsMatchIn(msg0)
++            if (has) return ensureTrailingNewline(msg0)
++            val base = msg0.trimEnd('\r','\n')
++            val sep = when {
++                base.isEmpty()        -> ""
++                base.endsWith("\n\n") -> ""
++                base.endsWith("\n")   -> "\n"
++                else                  -> "\n\n"
++            }
++            val email = id.emailAddress ?: ""
++            return base + sep + "Signed-off-by: ${id.name} <$email>\n"
++        }
++
++        private fun externalSignedCommitOrNull(
++            repoDir: String,
++            treeId: ObjectId,
++            parent: RevCommit?,
++            message: String,
++            ident: PersonIdent
++        ): ObjectId? {
++            return try {
++                val cmd = mutableListOf("git", "-C", repoDir, "commit-tree", "-S", treeId.name())
++                if (parent != null) cmd.addAll(listOf("-p", parent.id.name()))
++                cmd.addAll(listOf("-F", "-"))
++
++                val pb = ProcessBuilder(cmd).redirectErrorStream(true)
++                prepareCommitEnv(pb.environment(), ident)
++
++                val p = pb.start()
++                p.outputStream.use { it.write(ensureTrailingNewline(message).toByteArray(Charsets.UTF_8)) }
++
++                val out = p.inputStream.bufferedReader().readText().trim()
++                val code = p.waitFor()
++                if (code == 0 && out.isNotBlank()) {
++                    parseCommitTreeOutputToObjectId(out)?.also {
++                        log.info("External signed commit created: {}", it.name())
++                    }
++                } else {
++                    log.warn("External commit-tree failed (code={}): {}", code, out)
++                    null
++                }
++            } catch (t: Throwable) {
++                log.warn("External commit-tree exception: {}", t.toString())
++                null
++            }
++        }
++
++        private fun prepareCommitEnv(env: MutableMap<String, String>, ident: PersonIdent) {
++            env["HOME"] = System.getProperty("user.home")
++            env["GNUPGHOME"] = System.getenv("GNUPGHOME") ?: (System.getProperty("user.home") + "/.gnupg")
++            val path = System.getenv("PATH") ?: ""
++            val localBin = System.getProperty("user.home") + "/.local/bin"
++            env["PATH"] = if (path.split(':').contains(localBin)) path else if (path.isEmpty()) localBin else "$path:$localBin"
++            env["GIT_AUTHOR_NAME"] = ident.name
++            env["GIT_AUTHOR_EMAIL"] = ident.emailAddress ?: ""
++            env["GIT_COMMITTER_NAME"] = ident.name
++            env["GIT_COMMITTER_EMAIL"] = ident.emailAddress ?: ""
++        }
++
++        private fun parseCommitTreeOutputToObjectId(out: String): ObjectId? {
++            val first = out.lineSequence().firstOrNull()?.trim().orEmpty()
++            val token = first.split(Regex("\\s+")).lastOrNull().orEmpty()
++            val hex = Regex("^[0-9a-fA-F]{40}$")
++            val sha = when {
++                hex.matches(first) -> first
++                hex.matches(token) -> token
++                else -> ""
++            }
++            return if (sha.isNotEmpty()) ObjectId.fromString(sha) else null
++        }
++
+         private fun createIdent(userInfo: User): PersonIdent {
+             return PersonIdent(userInfo.realName, userInfo.email ?: "")
+         }
 -- 
 2.51.0
 
